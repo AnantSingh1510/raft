@@ -52,6 +52,26 @@ impl Operation {
 pub struct StateVector(BTreeMap<ClientId, Clock>);
 
 impl StateVector {
+    pub fn from_entries<I>(entries: I) -> Result<Self, CrdtError>
+    where
+        I: IntoIterator<Item = (ClientId, Clock)>,
+    {
+        let mut vector = Self::default();
+
+        for (client, clock) in entries {
+            if client == 0 {
+                return Err(CrdtError::InvalidClientId);
+            }
+            vector.0.insert(client, clock);
+        }
+
+        Ok(vector)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (ClientId, Clock)> + '_ {
+        self.0.iter().map(|(client, clock)| (*client, *clock))
+    }
+
     pub fn clock_for(&self, client: ClientId) -> Clock {
         self.0.get(&client).copied().unwrap_or_default()
     }
@@ -117,8 +137,16 @@ impl Document {
         encode_operations(missing)
     }
 
+    pub fn diff_from_encoded_state_vector(&self, remote: &[u8]) -> Result<Vec<u8>, CrdtError> {
+        self.diff(&decode_state_vector(remote)?)
+    }
+
     pub fn encode_state(&self) -> Result<Vec<u8>, CrdtError> {
         encode_operations(self.store.values().cloned())
+    }
+
+    pub fn encode_state_vector(&self) -> Result<Vec<u8>, CrdtError> {
+        encode_state_vector(&self.state_vector)
     }
 
     pub fn decode_state(id: impl Into<String>, bytes: &[u8]) -> Result<Self, CrdtError> {
@@ -269,6 +297,14 @@ impl TextDocument {
 
     pub fn encode_state(&self) -> Result<Vec<u8>, CrdtError> {
         self.doc.encode_state()
+    }
+
+    pub fn encode_state_vector(&self) -> Result<Vec<u8>, CrdtError> {
+        self.doc.encode_state_vector()
+    }
+
+    pub fn diff_from_encoded_state_vector(&self, remote: &[u8]) -> Result<Vec<u8>, CrdtError> {
+        self.doc.diff_from_encoded_state_vector(remote)
     }
 
     fn next_id(&mut self) -> OpId {
@@ -443,6 +479,40 @@ pub fn decode_operations(bytes: &[u8]) -> Result<Vec<Operation>, CrdtError> {
     Ok(ops)
 }
 
+pub fn encode_state_vector(vector: &StateVector) -> Result<Vec<u8>, CrdtError> {
+    let entries = vector.entries().collect::<Vec<_>>();
+    let mut bytes = Vec::with_capacity(4 + entries.len() * 16);
+    bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+    for (client, clock) in entries {
+        if client == 0 {
+            return Err(CrdtError::InvalidClientId);
+        }
+        bytes.extend_from_slice(&client.to_be_bytes());
+        bytes.extend_from_slice(&clock.to_be_bytes());
+    }
+
+    Ok(bytes)
+}
+
+pub fn decode_state_vector(bytes: &[u8]) -> Result<StateVector, CrdtError> {
+    let mut cursor = Cursor::new(bytes);
+    let count = cursor.u32()? as usize;
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let client = cursor.u64()?;
+        let clock = cursor.u64()?;
+        entries.push((client, clock));
+    }
+
+    if !cursor.is_done() {
+        return Err(CrdtError::TrailingBytes);
+    }
+
+    StateVector::from_entries(entries)
+}
+
 fn write_op_id(bytes: &mut Vec<u8>, id: OpId) {
     bytes.extend_from_slice(&id.client.to_be_bytes());
     bytes.extend_from_slice(&id.clock.to_be_bytes());
@@ -560,6 +630,38 @@ mod tests {
 
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].id, OpId::new(1, 2).unwrap());
+    }
+
+    #[test]
+    fn encodes_and_decodes_state_vectors() {
+        let vector = StateVector::from_entries([(1, 3), (2, 7)]).unwrap();
+
+        let decoded = decode_state_vector(&encode_state_vector(&vector).unwrap()).unwrap();
+
+        assert_eq!(decoded.clock_for(1), 3);
+        assert_eq!(decoded.clock_for(2), 7);
+    }
+
+    #[test]
+    fn diffs_from_encoded_state_vector() {
+        let mut alice = TextDocument::new("doc", 1).unwrap();
+        let mut bob = TextDocument::new("doc", 2).unwrap();
+
+        bob.apply_update(&alice.insert(0, "Ra").unwrap()).unwrap();
+        let missing = alice
+            .diff_from_encoded_state_vector(&bob.encode_state_vector().unwrap())
+            .unwrap();
+        assert!(decode_operations(&missing).unwrap().is_empty());
+
+        let new_update = alice.insert(2, "ft").unwrap();
+        let diff = alice
+            .diff_from_encoded_state_vector(&bob.encode_state_vector().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            decode_operations(&diff).unwrap(),
+            decode_operations(&new_update).unwrap()
+        );
     }
 
     #[test]

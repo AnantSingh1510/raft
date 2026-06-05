@@ -18,11 +18,17 @@ export interface Operation {
   deleted: boolean;
 }
 
+export type StateVector = Map<number, number>;
+
 export interface RaftClientOptions {
   roomId: string;
   url: string;
   protocols?: string | string[];
   WebSocketImpl?: typeof WebSocket;
+  autoReconnect?: boolean;
+  reconnectDelayMs?: number;
+  queueWhileOffline?: boolean;
+  maxQueuedUpdates?: number;
 }
 
 export type UpdateHandler = (update: Uint8Array) => void;
@@ -108,6 +114,29 @@ export class RaftTextDocument {
 
   encodeState(): Uint8Array {
     return encodeOperations([...this.operations.values()].sort(compareOpIdByOperation));
+  }
+
+  stateVector(): StateVector {
+    const vector: StateVector = new Map();
+    for (const op of this.operations.values()) {
+      vector.set(op.id.client, Math.max(vector.get(op.id.client) ?? 0, op.id.clock));
+    }
+    return vector;
+  }
+
+  encodeStateVector(): Uint8Array {
+    return encodeStateVector(this.stateVector());
+  }
+
+  diff(remote: StateVector): Uint8Array {
+    const missing = [...this.operations.values()]
+      .filter((op) => op.id.clock > (remote.get(op.id.client) ?? 0))
+      .sort(compareOpIdByOperation);
+    return encodeOperations(missing);
+  }
+
+  diffFromEncodedStateVector(remote: Uint8Array): Uint8Array {
+    return this.diff(decodeStateVector(remote));
   }
 
   private nextId(): OpId {
@@ -213,7 +242,14 @@ export class RaftClient {
   private readonly endpoint: string;
   private readonly protocols?: string | string[];
   private readonly WebSocketImpl: typeof WebSocket;
+  private readonly autoReconnect: boolean;
+  private readonly reconnectDelayMs: number;
+  private readonly queueWhileOffline: boolean;
+  private readonly maxQueuedUpdates: number;
   private socket: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private closeRequested = false;
+  private queuedUpdates: Uint8Array[] = [];
   private updateHandlers = new Set<UpdateHandler>();
   private stateHandlers = new Set<StateHandler>();
   private stateValue: ConnectionState = "idle";
@@ -228,6 +264,10 @@ export class RaftClient {
     this.endpoint = joinRoomUrl(options.url, options.roomId);
     this.protocols = options.protocols;
     this.WebSocketImpl = WebSocketImpl;
+    this.autoReconnect = options.autoReconnect ?? false;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? 1_000;
+    this.queueWhileOffline = options.queueWhileOffline ?? true;
+    this.maxQueuedUpdates = options.maxQueuedUpdates ?? 1_000;
   }
 
   get state(): ConnectionState {
@@ -235,6 +275,9 @@ export class RaftClient {
   }
 
   connect(): void {
+    this.closeRequested = false;
+    this.clearReconnectTimer();
+
     if (
       this.socket &&
       (this.socket.readyState === this.WebSocketImpl.CONNECTING ||
@@ -248,8 +291,19 @@ export class RaftClient {
     socket.binaryType = "arraybuffer";
     this.socket = socket;
 
-    socket.addEventListener("open", () => this.setState("open"));
-    socket.addEventListener("close", () => this.setState("closed"));
+    socket.addEventListener("open", () => {
+      this.setState("open");
+      this.flushQueue();
+    });
+    socket.addEventListener("close", () => {
+      if (this.socket === socket) {
+        this.socket = null;
+      }
+      this.setState("closed");
+      if (this.autoReconnect && !this.closeRequested) {
+        this.scheduleReconnect();
+      }
+    });
     socket.addEventListener("message", (event) => {
       if (event.data instanceof ArrayBuffer) {
         this.emitUpdate(new Uint8Array(event.data));
@@ -258,17 +312,30 @@ export class RaftClient {
   }
 
   disconnect(): void {
+    this.closeRequested = true;
+    this.clearReconnectTimer();
     this.socket?.close();
     this.socket = null;
     this.setState("closed");
   }
 
   send(update: Uint8Array): void {
+    if (this.socket && this.socket.readyState === this.WebSocketImpl.OPEN) {
+      this.socket.send(update);
+      return;
+    }
+
+    if (this.queueWhileOffline) {
+      if (this.queuedUpdates.length >= this.maxQueuedUpdates) {
+        throw new Error("RaftClient offline queue is full");
+      }
+      this.queuedUpdates.push(update);
+      return;
+    }
+
     if (!this.socket || this.socket.readyState !== this.WebSocketImpl.OPEN) {
       throw new Error("RaftClient is not connected");
     }
-
-    this.socket.send(update);
   }
 
   onUpdate(handler: UpdateHandler): () => void {
@@ -295,6 +362,35 @@ export class RaftClient {
     this.stateValue = state;
     for (const handler of this.stateHandlers) {
       handler(state);
+    }
+  }
+
+  private flushQueue(): void {
+    if (!this.socket || this.socket.readyState !== this.WebSocketImpl.OPEN) {
+      return;
+    }
+
+    const updates = this.queuedUpdates.splice(0);
+    for (const update of updates) {
+      this.socket.send(update);
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) {
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, this.reconnectDelayMs);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 }
@@ -386,6 +482,52 @@ export function decodeOperations(bytes: Uint8Array): Operation[] {
   }
 
   return ops;
+}
+
+export function encodeStateVector(vector: StateVector): Uint8Array {
+  const entries = [...vector.entries()].sort((left, right) => left[0] - right[0]);
+  const bytes = new Uint8Array(4 + entries.length * 16);
+  const view = new DataView(bytes.buffer);
+  let offset = 0;
+  view.setUint32(offset, entries.length, false);
+  offset += 4;
+
+  for (const [client, clock] of entries) {
+    assertValidInteger(client, "client");
+    assertValidInteger(clock, "clock");
+    if (client === 0) {
+      throw new Error("client id must be non-zero");
+    }
+    view.setBigUint64(offset, BigInt(client), false);
+    view.setBigUint64(offset + 8, BigInt(clock), false);
+    offset += 16;
+  }
+
+  return bytes;
+}
+
+export function decodeStateVector(bytes: Uint8Array): StateVector {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  const count = readUint32(view, offset);
+  offset += 4;
+  const vector: StateVector = new Map();
+
+  for (let i = 0; i < count; i += 1) {
+    const client = Number(readBigUint64(view, offset));
+    const clock = Number(readBigUint64(view, offset + 8));
+    offset += 16;
+    if (client === 0) {
+      throw new Error("client id must be non-zero");
+    }
+    vector.set(client, clock);
+  }
+
+  if (offset !== bytes.byteLength) {
+    throw new Error("encoded state vector contained trailing bytes");
+  }
+
+  return vector;
 }
 
 interface TextItem {

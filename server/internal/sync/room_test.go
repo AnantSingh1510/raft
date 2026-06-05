@@ -6,7 +6,7 @@ import (
 )
 
 func TestRoomBroadcastSkipsSender(t *testing.T) {
-	room := NewRoom("test")
+	room := NewRoom("test", nil, nil)
 	go room.Run()
 
 	sender := NewClient(room, nil)
@@ -33,7 +33,7 @@ func TestRoomBroadcastSkipsSender(t *testing.T) {
 }
 
 func TestRoomReplaysHistoryToLateJoiner(t *testing.T) {
-	room := NewRoom("test")
+	room := NewRoom("test", nil, nil)
 	go room.Run()
 
 	sender := NewClient(room, nil)

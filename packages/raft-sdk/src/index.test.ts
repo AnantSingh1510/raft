@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RaftTextDocument, decodeOperations, encodeOperations, joinRoomUrl, type Operation } from "./index.js";
+import {
+  RaftClient,
+  RaftTextDocument,
+  decodeOperations,
+  decodeStateVector,
+  encodeOperations,
+  encodeStateVector,
+  joinRoomUrl,
+  type Operation,
+} from "./index.js";
 
 test("encodes and decodes operations", () => {
   const op: Operation = {
@@ -38,7 +47,113 @@ test("text document restores encoded state", () => {
   assert.equal(restored.text, "hllo");
 });
 
+test("encodes state vectors and diffs from them", () => {
+  const alice = new RaftTextDocument(1);
+  const bob = new RaftTextDocument(2);
+
+  bob.applyUpdate(alice.insert(0, "Ra"));
+  assert.deepEqual([...decodeStateVector(bob.encodeStateVector())], [[1, 2]]);
+
+  const update = alice.insert(2, "ft");
+  const diff = alice.diffFromEncodedStateVector(bob.encodeStateVector());
+
+  assert.deepEqual(decodeOperations(diff), decodeOperations(update));
+  bob.applyUpdate(diff);
+  assert.equal(bob.text, "Raft");
+});
+
+test("round trips explicit state vectors", () => {
+  const vector = new Map([
+    [1, 3],
+    [2, 7],
+  ]);
+
+  assert.deepEqual([...decodeStateVector(encodeStateVector(vector))], [...vector]);
+});
+
 test("joins room URLs", () => {
   assert.equal(joinRoomUrl("ws://localhost:8080", "notes"), "ws://localhost:8080/rooms/notes");
   assert.equal(joinRoomUrl("ws://localhost:8080/api/", "a b"), "ws://localhost:8080/api/rooms/a%20b");
 });
+
+test("client queues updates while offline and flushes on open", () => {
+  FakeWebSocket.instances = [];
+  const client = new RaftClient({
+    url: "ws://localhost:8080",
+    roomId: "notes",
+    WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+  });
+  const update = new Uint8Array([1, 2, 3]);
+
+  client.send(update);
+  client.connect();
+
+  const socket = FakeWebSocket.instances[0]!;
+  assert.equal(socket.sent.length, 0);
+  socket.open();
+
+  assert.deepEqual(socket.sent, [update]);
+});
+
+test("client auto reconnects after unexpected close", async () => {
+  FakeWebSocket.instances = [];
+  const client = new RaftClient({
+    url: "ws://localhost:8080",
+    roomId: "notes",
+    WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    autoReconnect: true,
+    reconnectDelayMs: 1,
+  });
+
+  client.connect();
+  FakeWebSocket.instances[0]!.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(FakeWebSocket.instances.length, 2);
+  client.disconnect();
+});
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
+
+  readonly sent: Uint8Array[] = [];
+  readyState = FakeWebSocket.CONNECTING;
+  binaryType: BinaryType = "arraybuffer";
+  private listeners = new Map<string, Array<(event: any) => void>>();
+
+  constructor(readonly url: string, readonly protocols?: string | string[]) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: any) => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+    if (data instanceof Uint8Array) {
+      this.sent.push(data);
+      return;
+    }
+    throw new Error("fake socket only accepts Uint8Array test payloads");
+  }
+
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.emit("close", {});
+  }
+
+  open(): void {
+    this.readyState = FakeWebSocket.OPEN;
+    this.emit("open", {});
+  }
+
+  private emit(type: string, event: any): void {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event);
+    }
+  }
+}

@@ -11,10 +11,30 @@ import (
 type Hub struct {
 	mu    sync.Mutex
 	rooms map[string]*Room
+	store Store
 }
 
-func NewHub() *Hub {
-	return &Hub{rooms: map[string]*Room{}}
+type HubOptions struct {
+	DataDir string
+	Store   Store
+}
+
+func NewHub(options ...HubOptions) (*Hub, error) {
+	var opts HubOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+
+	store := opts.Store
+	if store == nil && opts.DataDir != "" {
+		fileStore, err := NewFileStore(opts.DataDir)
+		if err != nil {
+			return nil, err
+		}
+		store = fileStore
+	}
+
+	return &Hub{rooms: map[string]*Room{}, store: store}, nil
 }
 
 func (h *Hub) ServeRoom(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +61,14 @@ func (h *Hub) room(id string) *Room {
 
 	room, ok := h.rooms[id]
 	if !ok {
-		room = NewRoom(id)
+		history := [][]byte(nil)
+		if h.store != nil {
+			loaded, err := h.store.Load(id)
+			if err == nil {
+				history = loaded
+			}
+		}
+		room = NewRoom(id, h.store, history)
 		h.rooms[id] = room
 		go room.Run()
 	}

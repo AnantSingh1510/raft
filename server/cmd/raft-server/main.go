@@ -10,7 +10,12 @@ import (
 
 func main() {
 	addr := env("RAFT_ADDR", ":8080")
-	hub := sync.NewHub()
+	hub, err := sync.NewHub(sync.HubOptions{
+		DataDir: os.Getenv("RAFT_DATA_DIR"),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
