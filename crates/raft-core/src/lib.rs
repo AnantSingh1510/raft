@@ -152,18 +152,26 @@ impl Document {
     }
 
     fn drain_pending(&mut self) {
-        let mut remaining = VecDeque::new();
+        loop {
+            let mut progressed = false;
+            let mut remaining = VecDeque::new();
 
-        while let Some(op) = self.pending.pop_front() {
-            if self.has_origin(op.origin_left) && self.has_origin(op.origin_right) {
-                self.state_vector.observe(op.id);
-                self.store.insert(op.id, op);
-            } else {
-                remaining.push_back(op);
+            while let Some(op) = self.pending.pop_front() {
+                if self.has_origin(op.origin_left) && self.has_origin(op.origin_right) {
+                    self.state_vector.observe(op.id);
+                    self.store.insert(op.id, op);
+                    progressed = true;
+                } else {
+                    remaining.push_back(op);
+                }
+            }
+
+            self.pending = remaining;
+
+            if !progressed {
+                return;
             }
         }
-
-        self.pending = remaining;
     }
 }
 
@@ -173,6 +181,7 @@ pub enum CrdtError {
     UnexpectedEof,
     InvalidContentType(u8),
     ContentTooLarge,
+    InvalidUtf8,
     TrailingBytes,
 }
 
@@ -183,6 +192,7 @@ impl fmt::Display for CrdtError {
             Self::UnexpectedEof => write!(f, "encoded operation ended unexpectedly"),
             Self::InvalidContentType(value) => write!(f, "invalid operation content type: {value}"),
             Self::ContentTooLarge => write!(f, "operation content is too large"),
+            Self::InvalidUtf8 => write!(f, "text operation content is not valid UTF-8"),
             Self::TrailingBytes => write!(f, "encoded operation contained trailing bytes"),
         }
     }
@@ -234,7 +244,9 @@ pub fn decode_operations(bytes: &[u8]) -> Result<Vec<Operation>, CrdtError> {
         let payload = cursor.bytes(content_len)?;
 
         let content = match content_type {
-            1 => OpContent::Text(String::from_utf8_lossy(payload).into_owned()),
+            1 => OpContent::Text(
+                String::from_utf8(payload.to_vec()).map_err(|_| CrdtError::InvalidUtf8)?,
+            ),
             2 => OpContent::Bytes(payload.to_vec()),
             3 => OpContent::Delete,
             value => return Err(CrdtError::InvalidContentType(value)),
@@ -387,5 +399,22 @@ mod tests {
 
         doc.integrate_operation(first).unwrap();
         assert_eq!(doc.operations().count(), 2);
+    }
+
+    #[test]
+    fn drains_chained_pending_operations() {
+        let first = Operation::text(OpId::new(1, 1).unwrap(), "a");
+        let mut second = Operation::text(OpId::new(1, 2).unwrap(), "b");
+        let mut third = Operation::text(OpId::new(1, 3).unwrap(), "c");
+        second.origin_left = Some(first.id);
+        third.origin_left = Some(second.id);
+
+        let mut doc = Document::new("doc");
+        doc.integrate_operation(third).unwrap();
+        doc.integrate_operation(second).unwrap();
+        doc.integrate_operation(first).unwrap();
+
+        assert_eq!(doc.operations().count(), 3);
+        assert_eq!(doc.state_vector().clock_for(1), 3);
     }
 }

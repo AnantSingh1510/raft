@@ -22,10 +22,15 @@ export class RaftClient {
   private stateValue: ConnectionState = "idle";
 
   constructor(options: RaftClientOptions) {
+    const WebSocketImpl = options.WebSocketImpl ?? globalThis.WebSocket;
+    if (!WebSocketImpl) {
+      throw new Error("RaftClient requires a WebSocket implementation");
+    }
+
     this.roomId = options.roomId;
     this.endpoint = joinRoomUrl(options.url, options.roomId);
     this.protocols = options.protocols;
-    this.WebSocketImpl = options.WebSocketImpl ?? WebSocket;
+    this.WebSocketImpl = WebSocketImpl;
   }
 
   get state(): ConnectionState {
@@ -33,7 +38,11 @@ export class RaftClient {
   }
 
   connect(): void {
-    if (this.socket && (this.socket.readyState === WebSocket.CONNECTING || this.socket.readyState === WebSocket.OPEN)) {
+    if (
+      this.socket &&
+      (this.socket.readyState === this.WebSocketImpl.CONNECTING ||
+        this.socket.readyState === this.WebSocketImpl.OPEN)
+    ) {
       return;
     }
 
@@ -58,7 +67,7 @@ export class RaftClient {
   }
 
   send(update: Uint8Array): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    if (!this.socket || this.socket.readyState !== this.WebSocketImpl.OPEN) {
       throw new Error("RaftClient is not connected");
     }
 
@@ -99,4 +108,3 @@ export function joinRoomUrl(baseUrl: string, roomId: string): string {
   url.pathname = `${basePath}/rooms/${encodeURIComponent(roomId)}`;
   return url.toString();
 }
-

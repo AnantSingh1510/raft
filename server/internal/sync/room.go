@@ -42,7 +42,10 @@ func (r *Room) Run() {
 		case client := <-r.join:
 			r.clients[client] = struct{}{}
 			if len(r.lastUpdate) > 0 {
-				client.Send(r.lastUpdate)
+				if !client.Send(r.lastUpdate) {
+					delete(r.clients, client)
+					close(client.send)
+				}
 			}
 		case client := <-r.leave:
 			if _, ok := r.clients[client]; ok {
@@ -53,7 +56,10 @@ func (r *Room) Run() {
 			r.lastUpdate = append(r.lastUpdate[:0], message.Data...)
 			for client := range r.clients {
 				if client != message.Sender {
-					client.Send(message.Data)
+					if !client.Send(message.Data) {
+						delete(r.clients, client)
+						close(client.send)
+					}
 				}
 			}
 		}

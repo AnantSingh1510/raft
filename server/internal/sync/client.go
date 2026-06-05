@@ -27,11 +27,12 @@ func NewClient(room *Room, conn *websocket.Conn) *Client {
 	}
 }
 
-func (c *Client) Send(data []byte) {
+func (c *Client) Send(data []byte) bool {
 	select {
 	case c.send <- data:
+		return true
 	default:
-		c.room.Leave(c)
+		return false
 	}
 }
 
