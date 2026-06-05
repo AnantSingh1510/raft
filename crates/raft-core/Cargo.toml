@@ -1,0 +1,13 @@
+[package]
+name = "raft-core"
+version = "0.1.0"
+edition = "2024"
+description = "Rust CRDT core for Raft"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+

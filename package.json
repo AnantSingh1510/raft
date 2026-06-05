@@ -1,0 +1,14 @@
+{
+  "name": "raft",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Real-time collaborative CRDT engine",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces --if-present"
+  }
+}
+
