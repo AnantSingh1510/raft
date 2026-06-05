@@ -176,8 +176,182 @@ impl Document {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextDocument {
+    client_id: ClientId,
+    next_clock: Clock,
+    doc: Document,
+}
+
+impl TextDocument {
+    pub fn new(id: impl Into<String>, client_id: ClientId) -> Result<Self, CrdtError> {
+        if client_id == 0 {
+            return Err(CrdtError::InvalidClientId);
+        }
+
+        Ok(Self {
+            client_id,
+            next_clock: 1,
+            doc: Document::new(id),
+        })
+    }
+
+    pub fn document(&self) -> &Document {
+        &self.doc
+    }
+
+    pub fn text(&self) -> String {
+        self.visible_text_items()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    pub fn insert(&mut self, index: usize, value: &str) -> Result<Vec<u8>, CrdtError> {
+        let items = self.visible_text_items();
+        if index > items.len() {
+            return Err(CrdtError::IndexOutOfBounds);
+        }
+
+        let mut ops = Vec::new();
+        let mut origin_left = index
+            .checked_sub(1)
+            .and_then(|left| items.get(left))
+            .map(|item| item.id);
+        let origin_right = items.get(index).map(|item| item.id);
+
+        for text in value.chars().map(String::from) {
+            let id = self.next_id();
+            let op = Operation {
+                id,
+                origin_left,
+                origin_right,
+                content: OpContent::Text(text),
+                deleted: false,
+            };
+            self.doc.integrate_operation(op.clone())?;
+            origin_left = Some(id);
+            ops.push(op);
+        }
+
+        encode_operations(ops)
+    }
+
+    pub fn delete(&mut self, index: usize, len: usize) -> Result<Vec<u8>, CrdtError> {
+        let items = self.visible_text_items();
+        let end = index.checked_add(len).ok_or(CrdtError::IndexOutOfBounds)?;
+        if end > items.len() {
+            return Err(CrdtError::IndexOutOfBounds);
+        }
+
+        let mut ops = Vec::new();
+        for item in &items[index..end] {
+            let op = Operation {
+                id: self.next_id(),
+                origin_left: Some(item.id),
+                origin_right: None,
+                content: OpContent::Delete,
+                deleted: false,
+            };
+            self.doc.integrate_operation(op.clone())?;
+            ops.push(op);
+        }
+
+        encode_operations(ops)
+    }
+
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<(), CrdtError> {
+        self.doc.integrate_remote(update)?;
+        self.next_clock = self
+            .next_clock
+            .max(self.doc.state_vector().clock_for(self.client_id) + 1);
+        Ok(())
+    }
+
+    pub fn encode_state(&self) -> Result<Vec<u8>, CrdtError> {
+        self.doc.encode_state()
+    }
+
+    fn next_id(&mut self) -> OpId {
+        let id = OpId {
+            client: self.client_id,
+            clock: self.next_clock,
+        };
+        self.next_clock += 1;
+        id
+    }
+
+    fn visible_text_items(&self) -> Vec<TextItem> {
+        let deleted = self.deleted_targets();
+        let mut ordered = Vec::new();
+
+        for op in self.doc.store.values() {
+            if !matches!(op.content, OpContent::Text(_)) {
+                continue;
+            }
+
+            let position = if let Some(right) = op.origin_right {
+                ordered.iter().position(|item: &TextItem| item.id == right)
+            } else if let Some(left) = op.origin_left {
+                ordered
+                    .iter()
+                    .rposition(|item: &TextItem| item.id == left)
+                    .map(|pos| {
+                        let mut insert_at = pos + 1;
+                        while insert_at < ordered.len()
+                            && ordered[insert_at].origin_left == Some(left)
+                            && ordered[insert_at].id < op.id
+                        {
+                            insert_at += 1;
+                        }
+                        insert_at
+                    })
+            } else {
+                None
+            };
+
+            let item = TextItem {
+                id: op.id,
+                origin_left: op.origin_left,
+                text: match &op.content {
+                    OpContent::Text(text) => text.clone(),
+                    _ => unreachable!("text content checked above"),
+                },
+                visible: !op.deleted && !deleted.contains_key(&op.id),
+            };
+
+            match position {
+                Some(index) => ordered.insert(index, item),
+                None => ordered.push(item),
+            }
+        }
+
+        ordered.into_iter().filter(|item| item.visible).collect()
+    }
+
+    fn deleted_targets(&self) -> BTreeMap<OpId, OpId> {
+        self.doc
+            .store
+            .values()
+            .filter_map(|op| match op.content {
+                OpContent::Delete => op.origin_left.map(|target| (target, op.id)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextItem {
+    id: OpId,
+    origin_left: Option<OpId>,
+    text: String,
+    visible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CrdtError {
     InvalidClientId,
+    IndexOutOfBounds,
     UnexpectedEof,
     InvalidContentType(u8),
     ContentTooLarge,
@@ -189,6 +363,7 @@ impl fmt::Display for CrdtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidClientId => write!(f, "client id must be non-zero"),
+            Self::IndexOutOfBounds => write!(f, "text index is out of bounds"),
             Self::UnexpectedEof => write!(f, "encoded operation ended unexpectedly"),
             Self::InvalidContentType(value) => write!(f, "invalid operation content type: {value}"),
             Self::ContentTooLarge => write!(f, "operation content is too large"),
@@ -416,5 +591,47 @@ mod tests {
 
         assert_eq!(doc.operations().count(), 3);
         assert_eq!(doc.state_vector().clock_for(1), 3);
+    }
+
+    #[test]
+    fn text_document_inserts_and_deletes_text() {
+        let mut doc = TextDocument::new("doc", 1).unwrap();
+
+        doc.insert(0, "raft").unwrap();
+        doc.insert(2, "ft").unwrap();
+        doc.delete(2, 2).unwrap();
+
+        assert_eq!(doc.text(), "raft");
+    }
+
+    #[test]
+    fn text_documents_converge_with_binary_updates() {
+        let mut alice = TextDocument::new("doc", 1).unwrap();
+        let mut bob = TextDocument::new("doc", 2).unwrap();
+
+        let a1 = alice.insert(0, "Ra").unwrap();
+        bob.apply_update(&a1).unwrap();
+
+        let b1 = bob.insert(2, "ft").unwrap();
+        alice.apply_update(&b1).unwrap();
+
+        let a2 = alice.delete(1, 1).unwrap();
+        bob.apply_update(&a2).unwrap();
+
+        assert_eq!(alice.text(), "Rft");
+        assert_eq!(bob.text(), alice.text());
+    }
+
+    #[test]
+    fn text_document_restores_from_encoded_state() {
+        let mut doc = TextDocument::new("doc", 1).unwrap();
+        doc.insert(0, "hello").unwrap();
+        doc.delete(1, 1).unwrap();
+
+        let state = doc.encode_state().unwrap();
+        let mut restored = TextDocument::new("doc", 2).unwrap();
+        restored.apply_update(&state).unwrap();
+
+        assert_eq!(restored.text(), "hllo");
     }
 }

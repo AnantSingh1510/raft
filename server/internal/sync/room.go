@@ -6,12 +6,12 @@ type Message struct {
 }
 
 type Room struct {
-	ID         string
-	join       chan *Client
-	leave      chan *Client
-	broadcast  chan Message
-	clients    map[*Client]struct{}
-	lastUpdate []byte
+	ID        string
+	join      chan *Client
+	leave     chan *Client
+	broadcast chan Message
+	clients   map[*Client]struct{}
+	history   [][]byte
 }
 
 func NewRoom(id string) *Room {
@@ -41,27 +41,30 @@ func (r *Room) Run() {
 		select {
 		case client := <-r.join:
 			r.clients[client] = struct{}{}
-			if len(r.lastUpdate) > 0 {
-				if !client.Send(r.lastUpdate) {
-					delete(r.clients, client)
-					close(client.send)
+			for _, update := range r.history {
+				if !client.Send(update) {
+					r.drop(client)
+					break
 				}
 			}
 		case client := <-r.leave:
 			if _, ok := r.clients[client]; ok {
-				delete(r.clients, client)
-				close(client.send)
+				r.drop(client)
 			}
 		case message := <-r.broadcast:
-			r.lastUpdate = append(r.lastUpdate[:0], message.Data...)
+			r.history = append(r.history, append([]byte(nil), message.Data...))
 			for client := range r.clients {
 				if client != message.Sender {
 					if !client.Send(message.Data) {
-						delete(r.clients, client)
-						close(client.send)
+						r.drop(client)
 					}
 				}
 			}
 		}
 	}
+}
+
+func (r *Room) drop(client *Client) {
+	delete(r.clients, client)
+	close(client.send)
 }
