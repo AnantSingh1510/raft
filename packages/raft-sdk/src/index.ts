@@ -159,6 +159,48 @@ export class RaftTextDocument {
     return this.diff(decodeStateVector(remote));
   }
 
+  compactTombstones(stable: StateVector): number {
+    const referenced = new Map<string, number>();
+    const deleted = new Map<string, OpId[]>();
+
+    for (const op of this.operations.values()) {
+      if (op.originLeft) {
+        referenced.set(opKey(op.originLeft), (referenced.get(opKey(op.originLeft)) ?? 0) + 1);
+      }
+      if (op.originRight) {
+        referenced.set(opKey(op.originRight), (referenced.get(opKey(op.originRight)) ?? 0) + 1);
+      }
+      if (op.content.type === "delete" && op.originLeft) {
+        const key = opKey(op.originLeft);
+        deleted.set(key, [...(deleted.get(key) ?? []), op.id]);
+      }
+    }
+
+    const remove: string[] = [];
+    for (const [targetKey, deleteIds] of deleted) {
+      const target = this.operations.get(targetKey);
+      if (!target || target.content.type !== "text") {
+        continue;
+      }
+      if (!isStable(target.id, stable) || deleteIds.some((id) => !isStable(id, stable))) {
+        continue;
+      }
+      if ((referenced.get(targetKey) ?? 0) > deleteIds.length) {
+        continue;
+      }
+      if (deleteIds.some((id) => (referenced.get(opKey(id)) ?? 0) > 0)) {
+        continue;
+      }
+
+      remove.push(targetKey, ...deleteIds.map(opKey));
+    }
+
+    for (const key of remove) {
+      this.operations.delete(key);
+    }
+    return remove.length;
+  }
+
   private nextId(): OpId {
     return { client: this.clientId, clock: this.nextClock++ };
   }
@@ -207,52 +249,32 @@ export class RaftTextDocument {
   }
 
   private visibleTextItems(): TextItem[] {
+    return this.rgaSequence().filter((item) => item.visible);
+  }
+
+  private rgaSequence(): TextItem[] {
     const deleted = new Set(
       [...this.operations.values()]
         .filter((op) => op.content.type === "delete" && op.originLeft)
         .map((op) => opKey(op.originLeft!)),
     );
 
-    const ordered: TextItem[] = [];
-    const ops = [...this.operations.values()]
-      .filter((op) => op.content.type === "text")
-      .sort(compareOpIdByOperation);
-
-    for (const op of ops) {
-      const item: TextItem = {
-        id: op.id,
-        originLeft: op.originLeft,
-        text: op.content.type === "text" ? op.content.value : "",
-        visible: !op.deleted && !deleted.has(opKey(op.id)),
-      };
-
-      let position = -1;
-      if (op.originRight) {
-        position = ordered.findIndex((candidate) => sameOpId(candidate.id, op.originRight!));
-      } else if (op.originLeft) {
-        const leftIndex = findLastTextItemIndex(ordered, op.originLeft);
-        if (leftIndex >= 0) {
-          position = leftIndex + 1;
-          while (
-            position < ordered.length &&
-            op.originLeft &&
-            ordered[position]?.originLeft &&
-            sameOpId(ordered[position].originLeft!, op.originLeft) &&
-            compareOpId(ordered[position].id, op.id) < 0
-          ) {
-            position += 1;
-          }
-        }
+    const children = new Map<string, Operation[]>();
+    for (const op of this.operations.values()) {
+      if (op.content.type !== "text") {
+        continue;
       }
-
-      if (position >= 0) {
-        ordered.splice(position, 0, item);
-      } else {
-        ordered.push(item);
-      }
+      const key = optionalOpKey(op.originLeft);
+      children.set(key, [...(children.get(key) ?? []), op]);
     }
 
-    return ordered.filter((item) => item.visible);
+    for (const ops of children.values()) {
+      sortRgaSiblings(ops);
+    }
+
+    const ordered: TextItem[] = [];
+    appendRgaChildren(undefined, children, deleted, ordered);
+    return ordered;
   }
 }
 
@@ -633,8 +655,52 @@ export function decodeStateVector(bytes: Uint8Array): StateVector {
 interface TextItem {
   id: OpId;
   originLeft?: OpId;
+  originRight?: OpId;
   text: string;
   visible: boolean;
+}
+
+function appendRgaChildren(
+  parent: OpId | undefined,
+  children: Map<string, Operation[]>,
+  deleted: Set<string>,
+  ordered: TextItem[],
+): void {
+  for (const op of children.get(optionalOpKey(parent)) ?? []) {
+    if (op.content.type !== "text") {
+      continue;
+    }
+    ordered.push({
+      id: op.id,
+      originLeft: op.originLeft,
+      originRight: op.originRight,
+      text: op.content.value,
+      visible: !op.deleted && !deleted.has(opKey(op.id)),
+    });
+    appendRgaChildren(op.id, children, deleted, ordered);
+  }
+}
+
+function sortRgaSiblings(ops: Operation[]): void {
+  const sorted: Operation[] = [];
+  for (const op of ops.splice(0)) {
+    let index = 0;
+    while (index < sorted.length && rgaSiblingAfter(op, sorted[index]!)) {
+      index += 1;
+    }
+    sorted.splice(index, 0, op);
+  }
+  ops.push(...sorted);
+}
+
+function rgaSiblingAfter(left: Operation, right: Operation): boolean {
+  if (left.originRight && sameOpId(left.originRight, right.id)) {
+    return false;
+  }
+  if (right.originRight && sameOpId(right.originRight, left.id)) {
+    return true;
+  }
+  return compareOpId(left.id, right.id) > 0;
 }
 
 function encodeContent(content: OpContent, encoder: TextEncoder): Uint8Array {
@@ -733,6 +799,10 @@ function opKey(id: OpId): string {
   return `${id.client}:${id.clock}`;
 }
 
+function optionalOpKey(id?: OpId): string {
+  return id ? opKey(id) : "root";
+}
+
 function sameOpId(left: OpId, right: OpId): boolean {
   return left.client === right.client && left.clock === right.clock;
 }
@@ -745,12 +815,6 @@ function compareOpId(left: OpId, right: OpId): number {
   return left.client - right.client || left.clock - right.clock;
 }
 
-function findLastTextItemIndex(items: TextItem[], id: OpId): number {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (sameOpId(items[index]!.id, id)) {
-      return index;
-    }
-  }
-
-  return -1;
+function isStable(id: OpId, stable: StateVector): boolean {
+  return (stable.get(id.client) ?? 0) >= id.clock;
 }

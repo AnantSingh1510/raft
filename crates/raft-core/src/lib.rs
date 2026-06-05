@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
@@ -114,6 +116,10 @@ impl Document {
         self.store.values()
     }
 
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn apply_local(&mut self, op: Operation) -> Result<Vec<u8>, CrdtError> {
         self.integrate_operation(op.clone())?;
         encode_operations([op])
@@ -153,6 +159,57 @@ impl Document {
         let mut doc = Self::new(id);
         doc.integrate_remote(bytes)?;
         Ok(doc)
+    }
+
+    pub fn compact_tombstones(&mut self, stable: &StateVector) -> usize {
+        let mut referenced = BTreeMap::<OpId, usize>::new();
+        let mut deleted = BTreeMap::<OpId, Vec<OpId>>::new();
+
+        for op in self.store.values() {
+            if let Some(origin) = op.origin_left {
+                *referenced.entry(origin).or_default() += 1;
+            }
+            if let Some(origin) = op.origin_right {
+                *referenced.entry(origin).or_default() += 1;
+            }
+            if matches!(op.content, OpContent::Delete) {
+                if let Some(target) = op.origin_left {
+                    deleted.entry(target).or_default().push(op.id);
+                }
+            }
+        }
+
+        let mut remove = Vec::new();
+        for (target, delete_ids) in deleted {
+            let Some(target_op) = self.store.get(&target) else {
+                continue;
+            };
+            if !matches!(target_op.content, OpContent::Text(_)) {
+                continue;
+            }
+            if !is_stable(target, stable) || delete_ids.iter().any(|id| !is_stable(*id, stable)) {
+                continue;
+            }
+            let target_ref_count = referenced.get(&target).copied().unwrap_or_default();
+            if target_ref_count > delete_ids.len() {
+                continue;
+            }
+            if delete_ids
+                .iter()
+                .any(|id| referenced.get(id).copied().unwrap_or_default() > 0)
+            {
+                continue;
+            }
+
+            remove.push(target);
+            remove.extend(delete_ids);
+        }
+
+        let removed = remove.len();
+        for id in remove {
+            self.store.remove(&id);
+        }
+        removed
     }
 
     fn integrate_operation(&mut self, op: Operation) -> Result<(), CrdtError> {
@@ -228,8 +285,9 @@ impl TextDocument {
     }
 
     pub fn text(&self) -> String {
-        self.visible_text_items()
+        self.rga_sequence()
             .into_iter()
+            .filter(|item| item.visible)
             .map(|item| item.text)
             .collect()
     }
@@ -307,6 +365,10 @@ impl TextDocument {
         self.doc.diff_from_encoded_state_vector(remote)
     }
 
+    pub fn compact_tombstones(&mut self, stable: &StateVector) -> usize {
+        self.doc.compact_tombstones(stable)
+    }
+
     fn next_id(&mut self) -> OpId {
         let id = OpId {
             client: self.client_id,
@@ -317,53 +379,89 @@ impl TextDocument {
     }
 
     fn visible_text_items(&self) -> Vec<TextItem> {
+        self.rga_sequence()
+            .into_iter()
+            .filter(|item| item.visible)
+            .collect()
+    }
+
+    fn rga_sequence(&self) -> Vec<TextItem> {
         let deleted = self.deleted_targets();
-        let mut ordered = Vec::new();
+        let mut children = BTreeMap::<Option<OpId>, Vec<&Operation>>::new();
 
         for op in self.doc.store.values() {
             if !matches!(op.content, OpContent::Text(_)) {
                 continue;
             }
-
-            let position = if let Some(right) = op.origin_right {
-                ordered.iter().position(|item: &TextItem| item.id == right)
-            } else if let Some(left) = op.origin_left {
-                ordered
-                    .iter()
-                    .rposition(|item: &TextItem| item.id == left)
-                    .map(|pos| {
-                        let mut insert_at = pos + 1;
-                        while insert_at < ordered.len()
-                            && ordered[insert_at].origin_left == Some(left)
-                            && ordered[insert_at].id < op.id
-                        {
-                            insert_at += 1;
-                        }
-                        insert_at
-                    })
-            } else {
-                None
-            };
-
-            let item = TextItem {
-                id: op.id,
-                origin_left: op.origin_left,
-                text: match &op.content {
-                    OpContent::Text(text) => text.clone(),
-                    _ => unreachable!("text content checked above"),
-                },
-                visible: !op.deleted && !deleted.contains_key(&op.id),
-            };
-
-            match position {
-                Some(index) => ordered.insert(index, item),
-                None => ordered.push(item),
-            }
+            children.entry(op.origin_left).or_default().push(op);
         }
 
-        ordered.into_iter().filter(|item| item.visible).collect()
+        for ops in children.values_mut() {
+            sort_rga_siblings(ops);
+        }
+
+        let mut ordered = Vec::new();
+        append_rga_children(None, &children, &deleted, &mut ordered);
+        ordered
+    }
+}
+
+fn append_rga_children(
+    parent: Option<OpId>,
+    children: &BTreeMap<Option<OpId>, Vec<&Operation>>,
+    deleted: &BTreeMap<OpId, OpId>,
+    ordered: &mut Vec<TextItem>,
+) {
+    let Some(ops) = children.get(&parent) else {
+        return;
+    };
+
+    for op in ops {
+        let text = match &op.content {
+            OpContent::Text(text) => text.clone(),
+            _ => continue,
+        };
+
+        ordered.push(TextItem {
+            id: op.id,
+            origin_left: op.origin_left,
+            origin_right: op.origin_right,
+            text,
+            visible: !op.deleted && !deleted.contains_key(&op.id),
+        });
+        append_rga_children(Some(op.id), children, deleted, ordered);
+    }
+}
+
+fn sort_rga_siblings(ops: &mut Vec<&Operation>) {
+    let mut sorted = Vec::<&Operation>::with_capacity(ops.len());
+
+    for op in ops.drain(..) {
+        let mut index = 0;
+        while index < sorted.len() && rga_sibling_after(op, sorted[index]) {
+            index += 1;
+        }
+        sorted.insert(index, op);
     }
 
+    *ops = sorted;
+}
+
+fn rga_sibling_after(left: &Operation, right: &Operation) -> bool {
+    if left.origin_right == Some(right.id) {
+        return false;
+    }
+    if right.origin_right == Some(left.id) {
+        return true;
+    }
+    left.id > right.id
+}
+
+fn is_stable(id: OpId, stable: &StateVector) -> bool {
+    stable.clock_for(id.client) >= id.clock
+}
+
+impl TextDocument {
     fn deleted_targets(&self) -> BTreeMap<OpId, OpId> {
         self.doc
             .store
@@ -380,6 +478,7 @@ impl TextDocument {
 struct TextItem {
     id: OpId,
     origin_left: Option<OpId>,
+    origin_right: Option<OpId>,
     text: String,
     visible: bool,
 }
@@ -594,6 +693,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn encodes_and_decodes_operations() {
@@ -735,5 +835,185 @@ mod tests {
         restored.apply_update(&state).unwrap();
 
         assert_eq!(restored.text(), "hllo");
+    }
+
+    #[test]
+    fn rga_orders_concurrent_siblings_deterministically() {
+        let mut left = TextDocument::new("doc", 1).unwrap();
+        let mut right = TextDocument::new("doc", 2).unwrap();
+
+        let seed = left.insert(0, "a").unwrap();
+        right.apply_update(&seed).unwrap();
+
+        let left_update = left.insert(1, "x").unwrap();
+        let right_update = right.insert(1, "y").unwrap();
+
+        left.apply_update(&right_update).unwrap();
+        right.apply_update(&left_update).unwrap();
+
+        assert_eq!(left.text(), right.text());
+        assert_eq!(left.document().pending_len(), 0);
+        assert_eq!(right.document().pending_len(), 0);
+    }
+
+    #[test]
+    fn tombstone_compaction_removes_stable_unreferenced_deletes() {
+        let mut doc = TextDocument::new("doc", 1).unwrap();
+        doc.insert(0, "ab").unwrap();
+        doc.delete(1, 1).unwrap();
+
+        let before = doc.document().operations().count();
+        let stable = StateVector::from_entries([(1, 3)]).unwrap();
+        let removed = doc.compact_tombstones(&stable);
+
+        assert_eq!(removed, 2);
+        assert_eq!(doc.text(), "a");
+        assert_eq!(doc.document().operations().count(), before - 2);
+    }
+
+    #[test]
+    fn tombstone_compaction_keeps_referenced_deleted_anchors() {
+        let mut doc = TextDocument::new("doc", 1).unwrap();
+        doc.insert(0, "abc").unwrap();
+        doc.delete(1, 1).unwrap();
+
+        let stable = StateVector::from_entries([(1, 4)]).unwrap();
+        let removed = doc.compact_tombstones(&stable);
+
+        assert_eq!(removed, 0);
+        assert_eq!(doc.text(), "ac");
+    }
+
+    proptest! {
+        #[test]
+        fn randomized_replay_converges(actions in prop::collection::vec(any::<ModelAction>(), 1..80)) {
+            let updates = build_random_updates(&actions);
+            let mut forward = TextDocument::new("doc", 101).unwrap();
+            let mut reverse = TextDocument::new("doc", 102).unwrap();
+            let mut shuffled = TextDocument::new("doc", 103).unwrap();
+
+            for update in &updates {
+                forward.apply_update(update).unwrap();
+            }
+            for update in updates.iter().rev() {
+                reverse.apply_update(update).unwrap();
+            }
+            for index in deterministic_shuffle_indices(updates.len()) {
+                shuffled.apply_update(&updates[index]).unwrap();
+            }
+
+            prop_assert_eq!(forward.text(), reverse.text());
+            prop_assert_eq!(forward.text(), shuffled.text());
+            prop_assert_eq!(forward.document().pending_len(), 0);
+            prop_assert_eq!(reverse.document().pending_len(), 0);
+            prop_assert_eq!(shuffled.document().pending_len(), 0);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum ModelAction {
+        Insert {
+            client: u64,
+            index_hint: usize,
+            ch: char,
+        },
+        Delete {
+            client: u64,
+            index_hint: usize,
+        },
+    }
+
+    impl Arbitrary for ModelAction {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            prop_oneof![
+                (1_u64..=3, 0_usize..24, 0_u8..26).prop_map(|(client, index_hint, ch)| {
+                    Self::Insert {
+                        client,
+                        index_hint,
+                        ch: char::from(b'a' + ch),
+                    }
+                }),
+                (1_u64..=3, 0_usize..24)
+                    .prop_map(|(client, index_hint)| Self::Delete { client, index_hint }),
+            ]
+            .boxed()
+        }
+    }
+
+    fn build_random_updates(actions: &[ModelAction]) -> Vec<Vec<u8>> {
+        let mut docs = BTreeMap::<ClientId, TextDocument>::new();
+        let mut updates = Vec::new();
+
+        for action in actions {
+            match *action {
+                ModelAction::Insert {
+                    client,
+                    index_hint,
+                    ch,
+                } => {
+                    let doc = docs
+                        .entry(client)
+                        .or_insert_with(|| TextDocument::new("doc", client).unwrap());
+                    let index = bounded_index(index_hint, doc.text().chars().count(), true);
+                    let update = doc.insert(index, &ch.to_string()).unwrap();
+                    apply_to_other_docs(client, &mut docs, &update);
+                    updates.push(update);
+                }
+                ModelAction::Delete { client, index_hint } => {
+                    let doc = docs
+                        .entry(client)
+                        .or_insert_with(|| TextDocument::new("doc", client).unwrap());
+                    let len = doc.text().chars().count();
+                    if len == 0 {
+                        continue;
+                    }
+                    let index = bounded_index(index_hint, len, false);
+                    let update = doc.delete(index, 1).unwrap();
+                    apply_to_other_docs(client, &mut docs, &update);
+                    updates.push(update);
+                }
+            }
+        }
+
+        updates
+    }
+
+    fn apply_to_other_docs(
+        client: ClientId,
+        docs: &mut BTreeMap<ClientId, TextDocument>,
+        update: &[u8],
+    ) {
+        for (id, doc) in docs {
+            if *id != client {
+                doc.apply_update(update).unwrap();
+            }
+        }
+    }
+
+    fn bounded_index(index_hint: usize, len: usize, allow_end: bool) -> usize {
+        let modulus = if allow_end { len + 1 } else { len };
+        if modulus == 0 {
+            0
+        } else {
+            index_hint % modulus
+        }
+    }
+
+    fn deterministic_shuffle_indices(len: usize) -> Vec<usize> {
+        let mut remaining = (0..len).collect::<BTreeSet<_>>();
+        let mut order = Vec::with_capacity(len);
+        let mut cursor = 0usize;
+
+        while !remaining.is_empty() {
+            cursor = (cursor + 7) % remaining.len();
+            let index = *remaining.iter().nth(cursor).unwrap();
+            remaining.remove(&index);
+            order.push(index);
+        }
+
+        order
     }
 }

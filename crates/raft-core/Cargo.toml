@@ -11,3 +11,5 @@ crate-type = ["rlib"]
 [features]
 default = []
 
+[dev-dependencies]
+proptest = "1.6"

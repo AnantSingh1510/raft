@@ -21,15 +21,15 @@ examples/               Small runnable examples
 
 ## Current Status
 
-Raft is now a working v0.1 collaboration MVP. It includes:
+Raft is now a working v0.2 collaboration engine. It includes:
 
-- A Rust `TextDocument` that can insert, delete, encode state, and apply binary updates
+- A Rust RGA-style `TextDocument` that can insert, delete, encode state, compact tombstones, and apply binary updates
 - A language-neutral wire protocol, operation protocol, and state-vector protocol
 - A Go WebSocket sync server with room history replay and optional file persistence
-- A TypeScript `RaftTextDocument` and reconnect-capable `RaftClient` SDK with presence callbacks
-- Unit tests across Rust, Go, and TypeScript
+- A TypeScript `RaftTextDocument` mirror and reconnect-capable `RaftClient` SDK with presence callbacks
+- Unit, randomized convergence, and protocol tests across Rust, Go, and TypeScript
 
-This is not yet the final production YATA engine. The current text model is intentionally small and auditable so the transport, protocol, and SDK can evolve against something real.
+The Rust core is the CRDT source of truth. The TypeScript text document mirrors the same RGA ordering until the SDK is moved onto the Rust/WASM build.
 
 ## Getting Started
 
@@ -119,5 +119,8 @@ let update = alice.insert(0, "Hello")?;
 bob.apply_update(&update)?;
 
 assert_eq!(alice.text(), bob.text());
+
+let stable = alice.document().state_vector().clone();
+alice.compact_tombstones(&stable);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

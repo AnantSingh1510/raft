@@ -70,7 +70,17 @@ The Go server still accepts legacy raw update frames and treats them as update p
 
 ## Text Model
 
-The v0.1 text document stores immutable operations and renders visible text by ordering text inserts between their left and right origins. Delete operations do not remove historical inserts; they tombstone their target operation. This keeps encoded state replayable and gives the server permission to stay protocol-agnostic.
+The text document is an RGA-style CRDT. Inserts are immutable operations anchored by `origin_left` and optionally bounded by `origin_right`. Rendering builds the full tombstone-aware insertion graph first, sorts sibling inserts deterministically by right-origin constraints and operation ID, then filters deleted items from the visible string.
+
+Delete operations tombstone their target insert rather than removing it immediately. This keeps encoded state replayable and gives the server permission to stay protocol-agnostic.
+
+Tombstone compaction is available when a caller can provide a stable state vector. A deleted insert and its delete tombstones are compacted only when:
+
+- the target insert and delete operations are causally stable;
+- no remaining operation uses the deleted insert as an insertion anchor, except the delete tombstones being removed;
+- no operation references the delete tombstone itself.
+
+The Rust core includes randomized convergence tests that generate multi-client insert/delete histories and replay encoded updates in forward, reverse, and shuffled delivery order.
 
 ## Server Model
 

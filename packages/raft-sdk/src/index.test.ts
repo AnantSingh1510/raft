@@ -39,6 +39,20 @@ test("text documents converge with binary updates", () => {
   assert.equal(bob.text, alice.text);
 });
 
+test("text documents order concurrent siblings deterministically", () => {
+  const alice = new RaftTextDocument(1);
+  const bob = new RaftTextDocument(2);
+
+  bob.applyUpdate(alice.insert(0, "a"));
+  const left = alice.insert(1, "x");
+  const right = bob.insert(1, "y");
+
+  alice.applyUpdate(right);
+  bob.applyUpdate(left);
+
+  assert.equal(alice.text, bob.text);
+});
+
 test("text document restores encoded state", () => {
   const alice = new RaftTextDocument(1);
   alice.insert(0, "hello");
@@ -48,6 +62,28 @@ test("text document restores encoded state", () => {
   restored.applyUpdate(alice.encodeState());
 
   assert.equal(restored.text, "hllo");
+});
+
+test("text document compacts stable unreferenced tombstones", () => {
+  const doc = new RaftTextDocument(1);
+  doc.insert(0, "ab");
+  doc.delete(1, 1);
+
+  const before = decodeOperations(doc.encodeState()).length;
+  const removed = doc.compactTombstones(new Map([[1, 3]]));
+
+  assert.equal(removed, 2);
+  assert.equal(doc.text, "a");
+  assert.equal(decodeOperations(doc.encodeState()).length, before - 2);
+});
+
+test("text document keeps deleted anchors while referenced", () => {
+  const doc = new RaftTextDocument(1);
+  doc.insert(0, "abc");
+  doc.delete(1, 1);
+
+  assert.equal(doc.compactTombstones(new Map([[1, 4]])), 0);
+  assert.equal(doc.text, "ac");
 });
 
 test("encodes state vectors and diffs from them", () => {
