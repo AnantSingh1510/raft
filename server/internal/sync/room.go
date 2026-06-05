@@ -36,6 +36,10 @@ func (r *Room) Leave(client *Client) {
 }
 
 func (r *Room) Broadcast(message Message) {
+	r.Handle(message)
+}
+
+func (r *Room) Handle(message Message) {
 	r.broadcast <- message
 }
 
@@ -45,7 +49,7 @@ func (r *Room) Run() {
 		case client := <-r.join:
 			r.clients[client] = struct{}{}
 			for _, update := range r.history {
-				if !client.Send(update) {
+				if !client.Send(EncodeWireMessage(WireMessage{Type: WireUpdate, Payload: update})) {
 					r.drop(client)
 					break
 				}
@@ -55,17 +59,63 @@ func (r *Room) Run() {
 				r.drop(client)
 			}
 		case message := <-r.broadcast:
-			update := append([]byte(nil), message.Data...)
-			if r.store != nil {
-				_ = r.store.Append(r.ID, update)
+			r.handleMessage(message)
+		}
+	}
+}
+
+func (r *Room) handleMessage(message Message) {
+	wire, ok, err := DecodeWireMessage(message.Data)
+	if err != nil {
+		if message.Sender != nil {
+			message.Sender.Send(EncodeWireMessage(WireMessage{Type: WireError, Payload: []byte(err.Error())}))
+		}
+		return
+	}
+
+	if !ok {
+		r.acceptUpdate(message.Sender, message.Data)
+		return
+	}
+
+	switch wire.Type {
+	case WireUpdate:
+		r.acceptUpdate(message.Sender, wire.Payload)
+	case WireSync, WireStateVector:
+		vector, err := DecodeStateVector(wire.Payload)
+		if err != nil {
+			if message.Sender != nil {
+				message.Sender.Send(EncodeWireMessage(WireMessage{Type: WireError, Payload: []byte(err.Error())}))
 			}
-			r.history = append(r.history, update)
-			for client := range r.clients {
-				if client != message.Sender {
-					if !client.Send(message.Data) {
-						r.drop(client)
-					}
+			return
+		}
+		for _, update := range r.history {
+			if UpdateHasMissing(update, vector) {
+				if message.Sender != nil && !message.Sender.Send(EncodeWireMessage(WireMessage{Type: WireUpdate, Payload: update})) {
+					r.drop(message.Sender)
+					return
 				}
+			}
+		}
+	case WirePresence:
+		r.broadcastToPeers(message.Sender, EncodeWireMessage(wire))
+	}
+}
+
+func (r *Room) acceptUpdate(sender *Client, update []byte) {
+	update = append([]byte(nil), update...)
+	if r.store != nil {
+		_ = r.store.Append(r.ID, update)
+	}
+	r.history = append(r.history, update)
+	r.broadcastToPeers(sender, EncodeWireMessage(WireMessage{Type: WireUpdate, Payload: update}))
+}
+
+func (r *Room) broadcastToPeers(sender *Client, data []byte) {
+	for client := range r.clients {
+		if client != sender {
+			if !client.Send(data) {
+				r.drop(client)
 			}
 		}
 	}

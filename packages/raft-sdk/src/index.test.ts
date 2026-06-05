@@ -4,10 +4,13 @@ import test from "node:test";
 import {
   RaftClient,
   RaftTextDocument,
+  WireMessageType,
+  decodeWireMessage,
   decodeOperations,
   decodeStateVector,
   encodeOperations,
   encodeStateVector,
+  encodeWireMessage,
   joinRoomUrl,
   type Operation,
 } from "./index.js";
@@ -76,6 +79,15 @@ test("joins room URLs", () => {
   assert.equal(joinRoomUrl("ws://localhost:8080/api/", "a b"), "ws://localhost:8080/api/rooms/a%20b");
 });
 
+test("encodes and decodes wire messages", () => {
+  const message = {
+    type: WireMessageType.Update,
+    payload: new Uint8Array([1, 2, 3]),
+  };
+
+  assert.deepEqual(decodeWireMessage(encodeWireMessage(message)), message);
+});
+
 test("client queues updates while offline and flushes on open", () => {
   FakeWebSocket.instances = [];
   const client = new RaftClient({
@@ -92,7 +104,32 @@ test("client queues updates while offline and flushes on open", () => {
   assert.equal(socket.sent.length, 0);
   socket.open();
 
-  assert.deepEqual(socket.sent, [update]);
+  assert.deepEqual(decodeWireMessage(socket.sent[0]!), {
+    type: WireMessageType.Update,
+    payload: update,
+  });
+});
+
+test("client emits presence messages", () => {
+  FakeWebSocket.instances = [];
+  const client = new RaftClient({
+    url: "ws://localhost:8080",
+    roomId: "notes",
+    WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+  });
+  const seen: unknown[] = [];
+  client.onPresence((presence) => seen.push(presence));
+
+  client.connect();
+  const socket = FakeWebSocket.instances[0]!;
+  socket.message(
+    encodeWireMessage({
+      type: WireMessageType.Presence,
+      payload: new TextEncoder().encode(JSON.stringify({ user: "Ada" })),
+    }),
+  );
+
+  assert.deepEqual(seen, [{ user: "Ada" }]);
 });
 
 test("client auto reconnects after unexpected close", async () => {
@@ -149,6 +186,10 @@ class FakeWebSocket {
   open(): void {
     this.readyState = FakeWebSocket.OPEN;
     this.emit("open", {});
+  }
+
+  message(data: Uint8Array): void {
+    this.emit("message", { data: data.buffer });
   }
 
   private emit(type: string, event: any): void {

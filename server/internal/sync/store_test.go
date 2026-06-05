@@ -47,8 +47,12 @@ func TestHubLoadsPersistedHistoryForRoom(t *testing.T) {
 
 	select {
 	case got := <-late.send:
-		if string(got) != string([]byte{9}) {
-			t.Fatalf("late joiner got %v", got)
+		wire, ok, err := DecodeWireMessage(got)
+		if err != nil || !ok {
+			t.Fatalf("late joiner got invalid wire message: ok=%v err=%v", ok, err)
+		}
+		if wire.Type != WireUpdate || string(wire.Payload) != string([]byte{9}) {
+			t.Fatalf("late joiner got %v", wire)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("late joiner did not get persisted history")

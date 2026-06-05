@@ -1,5 +1,24 @@
 export type ConnectionState = "idle" | "connecting" | "open" | "closed";
 
+const WIRE_MAGIC_0 = 0x52;
+const WIRE_MAGIC_1 = 0x46;
+const WIRE_VERSION = 1;
+
+export enum WireMessageType {
+  Sync = 1,
+  StateVector = 2,
+  Update = 3,
+  Presence = 4,
+  Error = 5,
+}
+
+export type WireMessage =
+  | { type: WireMessageType.Sync; payload: Uint8Array }
+  | { type: WireMessageType.StateVector; payload: Uint8Array }
+  | { type: WireMessageType.Update; payload: Uint8Array }
+  | { type: WireMessageType.Presence; payload: Uint8Array }
+  | { type: WireMessageType.Error; payload: Uint8Array };
+
 export interface OpId {
   client: number;
   clock: number;
@@ -33,6 +52,7 @@ export interface RaftClientOptions {
 
 export type UpdateHandler = (update: Uint8Array) => void;
 export type StateHandler = (state: ConnectionState) => void;
+export type PresenceHandler = (presence: unknown) => void;
 
 export class RaftTextDocument {
   private readonly clientId: number;
@@ -252,6 +272,7 @@ export class RaftClient {
   private queuedUpdates: Uint8Array[] = [];
   private updateHandlers = new Set<UpdateHandler>();
   private stateHandlers = new Set<StateHandler>();
+  private presenceHandlers = new Set<PresenceHandler>();
   private stateValue: ConnectionState = "idle";
 
   constructor(options: RaftClientOptions) {
@@ -306,7 +327,7 @@ export class RaftClient {
     });
     socket.addEventListener("message", (event) => {
       if (event.data instanceof ArrayBuffer) {
-        this.emitUpdate(new Uint8Array(event.data));
+        this.handleMessage(new Uint8Array(event.data));
       }
     });
   }
@@ -320,8 +341,31 @@ export class RaftClient {
   }
 
   send(update: Uint8Array): void {
+    this.sendWireMessage({ type: WireMessageType.Update, payload: update });
+  }
+
+  sync(stateVector: Uint8Array): void {
+    this.sendWireMessage({ type: WireMessageType.Sync, payload: stateVector });
+  }
+
+  sendStateVector(stateVector: Uint8Array): void {
+    this.sendWireMessage({ type: WireMessageType.StateVector, payload: stateVector });
+  }
+
+  sendPresence(presence: unknown): void {
+    const payload = new TextEncoder().encode(JSON.stringify(presence));
+    this.sendWireMessage({ type: WireMessageType.Presence, payload });
+  }
+
+  onPresence(handler: PresenceHandler): () => void {
+    this.presenceHandlers.add(handler);
+    return () => this.presenceHandlers.delete(handler);
+  }
+
+  private sendWireMessage(message: WireMessage): void {
+    const frame = encodeWireMessage(message);
     if (this.socket && this.socket.readyState === this.WebSocketImpl.OPEN) {
-      this.socket.send(update);
+      this.socket.send(frame);
       return;
     }
 
@@ -329,7 +373,7 @@ export class RaftClient {
       if (this.queuedUpdates.length >= this.maxQueuedUpdates) {
         throw new Error("RaftClient offline queue is full");
       }
-      this.queuedUpdates.push(update);
+      this.queuedUpdates.push(frame);
       return;
     }
 
@@ -351,6 +395,30 @@ export class RaftClient {
   private emitUpdate(update: Uint8Array): void {
     for (const handler of this.updateHandlers) {
       handler(update);
+    }
+  }
+
+  private emitPresence(presence: unknown): void {
+    for (const handler of this.presenceHandlers) {
+      handler(presence);
+    }
+  }
+
+  private handleMessage(data: Uint8Array): void {
+    const message = isWireMessage(data) ? decodeWireMessage(data) : { type: WireMessageType.Update, payload: data };
+
+    switch (message.type) {
+      case WireMessageType.Update:
+        this.emitUpdate(message.payload);
+        break;
+      case WireMessageType.Presence:
+        this.emitPresence(JSON.parse(new TextDecoder().decode(message.payload)));
+        break;
+      case WireMessageType.Error:
+        throw new Error(new TextDecoder().decode(message.payload));
+      case WireMessageType.Sync:
+      case WireMessageType.StateVector:
+        break;
     }
   }
 
@@ -400,6 +468,38 @@ export function joinRoomUrl(baseUrl: string, roomId: string): string {
   const basePath = url.pathname.replace(/\/$/, "");
   url.pathname = `${basePath}/rooms/${encodeURIComponent(roomId)}`;
   return url.toString();
+}
+
+export function encodeWireMessage(message: WireMessage): Uint8Array {
+  const bytes = new Uint8Array(8 + message.payload.byteLength);
+  const view = new DataView(bytes.buffer);
+  bytes[0] = WIRE_MAGIC_0;
+  bytes[1] = WIRE_MAGIC_1;
+  bytes[2] = WIRE_VERSION;
+  bytes[3] = message.type;
+  view.setUint32(4, message.payload.byteLength, false);
+  bytes.set(message.payload, 8);
+  return bytes;
+}
+
+export function decodeWireMessage(bytes: Uint8Array): WireMessage {
+  if (!isWireMessage(bytes)) {
+    throw new Error("invalid Raft wire message");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const length = view.getUint32(4, false);
+  if (bytes.byteLength !== 8 + length) {
+    throw new Error("invalid Raft wire message length");
+  }
+  const type = bytes[3] as WireMessageType;
+  if (type < WireMessageType.Sync || type > WireMessageType.Error) {
+    throw new Error(`invalid Raft wire message type: ${type}`);
+  }
+  return { type, payload: bytes.slice(8) } as WireMessage;
+}
+
+export function isWireMessage(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= 8 && bytes[0] === WIRE_MAGIC_0 && bytes[1] === WIRE_MAGIC_1 && bytes[2] === WIRE_VERSION;
 }
 
 export function encodeOperations(ops: Operation[]): Uint8Array {

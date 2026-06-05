@@ -61,7 +61,7 @@ func (c *Client) readPump() {
 		if messageType != websocket.BinaryMessage {
 			continue
 		}
-		c.room.Broadcast(Message{Sender: c, Data: data})
+		c.room.Handle(Message{Sender: c, Data: data})
 	}
 }
 
