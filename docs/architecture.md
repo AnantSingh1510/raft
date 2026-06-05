@@ -8,7 +8,7 @@ Raft is split into three layers:
 
 ## Operation Protocol
 
-The operation protocol is intentionally compact and language-neutral. Rust and TypeScript both encode and decode this frame format:
+Document updates are carried inside a Raft wire message. The operation protocol is intentionally compact and language-neutral. Rust and TypeScript both encode and decode this frame format:
 
 ```text
 [op_count: u32]
@@ -48,22 +48,42 @@ Rust and TypeScript also share a compact state-vector frame:
 
 State vectors let one peer ask another for only the operations it has not seen yet. The current SDK exposes this through `encodeStateVector()` and `diffFromEncodedStateVector(...)`.
 
+## Wire Protocol
+
+All modern WebSocket messages use an envelope:
+
+```text
+[magic: "RF"][version: u8][type: u8][payload_len: u32][payload]
+```
+
+Message types:
+
+| Type | Name | Payload |
+|---:|---|---|
+| `1` | `sync` | Encoded state vector. Server responds with missing update messages. |
+| `2` | `state-vector` | Encoded state vector. Reserved for peer negotiation. |
+| `3` | `update` | Encoded operation update. Persisted and broadcast. |
+| `4` | `presence` | JSON presence payload. Broadcast only, not persisted. |
+| `5` | `error` | UTF-8 error string. |
+
+The Go server still accepts legacy raw update frames and treats them as update payloads. This keeps older clients from breaking during the protocol transition.
+
 ## Text Model
 
 The v0.1 text document stores immutable operations and renders visible text by ordering text inserts between their left and right origins. Delete operations do not remove historical inserts; they tombstone their target operation. This keeps encoded state replayable and gives the server permission to stay protocol-agnostic.
 
 ## Server Model
 
-The Go server owns WebSocket rooms. It accepts binary updates from any client, appends each update to the room history, broadcasts the update to other connected clients, and replays history to late joiners. When `RAFT_DATA_DIR` is set, each room history is also stored as an append-only length-prefixed log on disk.
+The Go server owns WebSocket rooms. It accepts update messages from any client, appends each update payload to the room history, broadcasts the update envelope to other connected clients, and replays history to late joiners. When `RAFT_DATA_DIR` is set, each room history is also stored as an append-only length-prefixed log on disk.
 
-The server does not inspect CRDT operations yet; persistence can store the same binary history without understanding document internals.
+For `sync` messages, the server parses the encoded state vector and scans stored operation updates. It sends back any update whose operation clock is newer than the requesting client's state vector. The server still keeps persistence simple by storing the original binary update payloads.
 
 ## SDK Model
 
 The TypeScript SDK contains two independent pieces:
 
 - `RaftTextDocument` for local text operations, binary update generation, and remote update application.
-- `RaftClient` for WebSocket room connection, binary send, offline queueing, optional reconnects, update callbacks, and connection-state callbacks.
+- `RaftClient` for WebSocket room connection, binary send, state-vector sync requests, presence messages, offline queueing, optional reconnects, update callbacks, presence callbacks, and connection-state callbacks.
 
 ## Release Surface
 

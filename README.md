@@ -24,9 +24,9 @@ examples/               Small runnable examples
 Raft is now a working v0.1 collaboration MVP. It includes:
 
 - A Rust `TextDocument` that can insert, delete, encode state, and apply binary updates
-- A language-neutral binary operation protocol and state-vector protocol
+- A language-neutral wire protocol, operation protocol, and state-vector protocol
 - A Go WebSocket sync server with room history replay and optional file persistence
-- A TypeScript `RaftTextDocument` and reconnect-capable `RaftClient` SDK
+- A TypeScript `RaftTextDocument` and reconnect-capable `RaftClient` SDK with presence callbacks
 - Unit tests across Rust, Go, and TypeScript
 
 This is not yet the final production YATA engine. The current text model is intentionally small and auditable so the transport, protocol, and SDK can evolve against something real.
@@ -95,10 +95,13 @@ const client = new RaftClient({
 });
 
 client.onUpdate((update) => doc.applyUpdate(update));
+client.onPresence((presence) => console.log("presence", presence));
 client.connect();
+client.sync(doc.encodeStateVector());
 
 const update = doc.insert(0, "Hello Raft");
 client.send(update);
+client.sendPresence({ user: "Ada", cursor: 10 });
 
 const stateVector = doc.encodeStateVector();
 const missingUpdate = doc.diffFromEncodedStateVector(stateVector);
